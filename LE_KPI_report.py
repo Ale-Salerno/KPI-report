@@ -31,6 +31,7 @@ def load_and_process_helpdesk_data(helpdesk_csv_path: str):
             'Close Date': 'close_date',
             'Closed Date': 'close_date',  # Added alternative
             'Date Closed': 'close_date',  # Added alternative
+            'Last updated': 'last_updated',  # Fallback date for resolved tickets without close_date
             'Date': 'creation_date',
             'TicketID': 'ticket_id',
             'Ticket ID': 'ticket_id',  # Added alternative
@@ -56,12 +57,19 @@ def load_and_process_helpdesk_data(helpdesk_csv_path: str):
         }
 
         if 'handled_by' in df_helpdesk.columns:
-            # Extract the user code (e.g., 'domain\aba' -> 'aba')
-            df_helpdesk['handled_by_code'] = df_helpdesk['handled_by'].astype(str).str.split('\\').str[
-                -1].str.lower().str.strip()
+            # Extract the user code from either format:
+            #   old export: 'DOMAIN\aba'  -> split by '\', take last part
+            #   new export: 'aba@domain'  -> split by '@', take first part
+            def extract_user_code(val):
+                s = str(val).strip().lower()
+                if '\\' in s:
+                    return s.split('\\')[-1].strip()
+                if '@' in s:
+                    return s.split('@')[0].strip()
+                return s
+            df_helpdesk['handled_by_code'] = df_helpdesk['handled_by'].apply(extract_user_code)
             df_helpdesk['vendor_name'] = df_helpdesk['handled_by_code'].map(engineer_map)
         else:
-            df_helpdesk['vendor_name'] = None
             df_helpdesk['vendor_name'] = None
 
         df_helpdesk.dropna(subset=['vendor_name'], inplace=True)
@@ -84,12 +92,29 @@ def load_and_process_helpdesk_data(helpdesk_csv_path: str):
         df_helpdesk['total_hours'] = df_helpdesk['time_spent'].astype(str).apply(parse_duration_to_hours)
         df_helpdesk['helpdesk_revenue'] = df_helpdesk['total_hours'] * 20
 
+        # Normalize status for case-insensitive, backward-compatible comparisons.
+        # Both 'Resolved' (new export) and 'Closed' (old export) are treated as completed/billable.
+        COMPLETED_STATUSES = {'resolved', 'closed'}
+        if 'status' in df_helpdesk.columns:
+            df_helpdesk['_status_norm'] = df_helpdesk['status'].astype(str).str.strip().str.lower()
+        else:
+            df_helpdesk['_status_norm'] = ''
+        df_helpdesk['_is_completed'] = df_helpdesk['_status_norm'].isin(COMPLETED_STATUSES)
+
         # Convert date columns
         df_helpdesk['creation_date'] = pd.to_datetime(df_helpdesk['creation_date'], errors='coerce')
         df_helpdesk['close_date'] = pd.to_datetime(df_helpdesk['close_date'], errors='coerce')
+        if 'last_updated' in df_helpdesk.columns:
+            df_helpdesk['last_updated'] = pd.to_datetime(df_helpdesk['last_updated'], errors='coerce')
 
         # Filter out rows with no creation date
         df_helpdesk.dropna(subset=['creation_date'], inplace=True)
+
+        # For completed tickets that lack a close_date, fall back to last_updated so they
+        # are still attributed to the correct period rather than silently disappearing.
+        if 'last_updated' in df_helpdesk.columns:
+            missing_close = df_helpdesk['_is_completed'] & df_helpdesk['close_date'].isna()
+            df_helpdesk.loc[missing_close, 'close_date'] = df_helpdesk.loc[missing_close, 'last_updated']
 
         # Use CLOSE date for revenue accounting.
         df_helpdesk['quarter'] = df_helpdesk['close_date'].dt.to_period('Q').astype(str)
@@ -102,7 +127,7 @@ def load_and_process_helpdesk_data(helpdesk_csv_path: str):
         # Return only columns that exist
         cols_to_return = [
             'vendor_name', 'quarter', 'month_num', 'helpdesk_revenue',
-            'ticket_id', 'url', 'status', 'subject', 'time_spent',
+            'ticket_id', 'url', 'status', '_is_completed', 'subject', 'time_spent',
             'creation_date', 'close_date', 'creation_quarter', 'creation_month_num'
         ]
         # Ensure we only return columns that are actually in the dataframe
@@ -399,8 +424,9 @@ def generate_le_report(csv_path: str, output_path: str, config: dict, helpdesk_d
                                     helpdesk_data['month_num'] == data_for_view['month_num'].iloc[0])]
 
                     if not helpdesk_for_revenue.empty:
+                        # Use _is_completed (supports both 'Resolved' and 'Closed', case-insensitively)
                         helpdesk_for_revenue_resolved = helpdesk_for_revenue[
-                            helpdesk_for_revenue['status'] == 'Resolved']
+                            helpdesk_for_revenue['_is_completed']]
                         if not helpdesk_for_revenue_resolved.empty:
                             total_helpdesk_revenue_view = helpdesk_for_revenue_resolved['helpdesk_revenue'].sum()
                             helpdesk_summary = helpdesk_for_revenue_resolved.groupby('vendor_name').agg(
@@ -612,7 +638,9 @@ def generate_le_report(csv_path: str, output_path: str, config: dict, helpdesk_d
 
                 pending_tickets_html = ""
                 if not helpdesk_for_lists.empty:
-                    pending_mask = (helpdesk_for_lists['status'] != 'Resolved') | (
+                    # A ticket is pending if it is not completed (Resolved/Closed), has no time logged,
+                    # or lacks a close_date (meaning it cannot yet be attributed to a period).
+                    pending_mask = (~helpdesk_for_lists['_is_completed']) | (
                             helpdesk_for_lists['time_spent'] == '00:00:00') | (
                                        pd.isna(helpdesk_for_lists['close_date']))
                     pending_df = helpdesk_for_lists[pending_mask].copy()
